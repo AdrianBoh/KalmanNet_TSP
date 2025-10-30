@@ -126,25 +126,39 @@ class KalmanNetNN(torch.nn.Module):
     ###########################
     ### Initialize Sequence ###
     ###########################
-    def InitSequence(self, M1_0, T):
+    def InitSequence(self, M1_0, T, history=10):
         """
         input M1_0 (torch.tensor): 1st moment of x at time 0 [batch_size, m, 1]
         """
         self.T = T
+        self.history = history
 
         self.m1x_posterior = M1_0.to(self.device)
         self.m1x_posterior_previous = self.m1x_posterior
         self.m1x_prior_previous = self.m1x_posterior
         self.y_previous = self.h(self.m1x_posterior)
 
+        self.m1x_posterior_history = self.m1x_posterior.repeat(1, 1, history)
+
     ######################
     ### Compute Priors ###
     ######################
-    def step_prior(self):
-        # Predict the 1-st moment of x
-        self.m1x_prior = self.f(self.m1x_posterior)
+    # def step_prior(self):
+    #     # Predict the 1-st moment of x
+    #     self.m1x_prior = self.f(self.m1x_posterior)
 
-        # Predict the 1-st moment of y
+    #     # Predict the 1-st moment of y
+    #     self.m1y = self.h(self.m1x_prior)
+
+    def step_prior(self):
+        """
+        Predict next state using a history-dependent prior function.
+        """
+
+        x_history = self.m1x_posterior_history[:, :, -self.history:]  # [batch, m, history]
+
+        self.m1x_prior = self.f(x_history)  # f is f_wrapper
+
         self.m1y = self.h(self.m1x_prior)
 
     ##############################
@@ -187,6 +201,16 @@ class KalmanNetNN(torch.nn.Module):
         INOV = torch.bmm(self.KGain, dy)
         self.m1x_posterior_previous = self.m1x_posterior
         self.m1x_posterior = self.m1x_prior + INOV
+
+        # Update posterior history buffer
+        self.m1x_posterior_history = torch.cat(
+            [self.m1x_posterior_history, self.m1x_posterior],
+            dim=-1
+        )
+
+        # Keep only the last 'history' timesteps
+        if self.m1x_posterior_history.shape[-1] > self.history:
+            self.m1x_posterior_history = self.m1x_posterior_history[:, :, -self.history:]
 
         #self.state_process_posterior_0 = self.state_process_prior_0
         self.m1x_prior_previous = self.m1x_prior
