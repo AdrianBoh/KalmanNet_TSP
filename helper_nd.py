@@ -65,6 +65,13 @@ def canonical_bell(u):
     out[mask] = 30*uu**2 - 60*uu**3 + 30*uu**4
     return out
 
+def canonical_bell_torch(u):
+    out = torch.zeros_like(u)
+    mask = (u >= 0) & (u <= 1)
+    uu = u[mask]
+    out[mask] = 30*uu**2 - 60*uu**3 + 30*uu**4
+    return out
+
 def reduced_cost(params, x, y, ridge=1e-12):
     """
     Cost function for optimizer: only s and l are free.
@@ -86,6 +93,26 @@ def reduced_cost(params, x, y, ridge=1e-12):
     resid = y - h*phi
     return float(np.sum(resid**2))
 
+
+def reduced_cost_torch(params: torch.Tensor, x: torch.Tensor, y: torch.Tensor, ridge=1e-12):
+    """
+    Cost function for optimizer: s and l are free, h computed analytically.
+    params: tensor [2] -> s, l
+    """
+    s, l = params[0], params[1]
+    if l <= 1e-12:
+        return torch.tensor(1e12, device=params.device)
+
+    u = (x - s) / l
+    phi = canonical_bell_torch(u)
+
+    if torch.all(phi == 0):
+        return torch.tensor(1e12, device=params.device)
+
+    h = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
+    resid = y - h * phi
+    return torch.sum(resid**2)
+
 def fit_bell_analytic_h(x, y):
     x = np.asarray(x)
     y = np.asarray(y)
@@ -104,7 +131,7 @@ def fit_bell_analytic_h(x, y):
     # Linear constraints: optional, ensure bell covers the segment
     A = np.array([[1, 0], [-1, -1]])
     b = np.array([x0, -x9])
-    lin_con = LinearConstraint(A, -np.inf*np.ones_like(b), b)
+    #lin_con = LinearConstraint(A, -np.inf*np.ones_like(b), b)
 
     # Optimize s and l
     res = minimize(reduced_cost, init, args=(x, y),
@@ -118,6 +145,38 @@ def fit_bell_analytic_h(x, y):
     sse = np.sum((y - h_opt*phi)**2)
 
     return s_opt, l_opt, h_opt, sse, res
+
+def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, n_iter=100):
+    """
+    PyTorch version of fit_bell_analytic_h.
+    x, y: 1D tensors
+    Returns s_opt, l_opt, h_opt, sse
+    """
+    device = x.device
+    x0, x9 = x.min(), x.max()
+
+    # Initial guess
+    s = torch.tensor(x0 + 0.25*(x9 - x0), dtype=torch.float32, device=device, requires_grad=True)
+    l = torch.tensor(max(0.5, (x9 - s).item()), dtype=torch.float32, device=device, requires_grad=True)
+
+    optimizer = torch.optim.LBFGS([s, l], max_iter=n_iter, line_search_fn='strong_wolfe')
+
+    def closure():
+        optimizer.zero_grad()
+        loss = reduced_cost_torch(torch.stack([s, l]), x, y)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        s_opt, l_opt = s.item(), l.item()
+        u = (x - s_opt)/l_opt
+        phi = canonical_bell_torch(u)
+        h_opt = torch.sum(phi * y) / torch.sum(phi**2)
+        sse = torch.sum((y - h_opt*phi)**2).item()
+
+    return s_opt, l_opt, h_opt.item(), sse
 
 def predict_minimal_jerk(x, y, l_prev=None, h_prev=None, s_prev=None, sse_prev=None, nbr_predictions=1):
     """
@@ -149,6 +208,28 @@ def predict_minimal_jerk(x, y, l_prev=None, h_prev=None, s_prev=None, sse_prev=N
 
     predictions = alpha*direct_predictions + (1-alpha)*predictions_from_previous
     return predictions, s, l, h, sse
+
+def predict_minimal_jerk_torch(x: torch.Tensor, y: torch.Tensor, nbr_predictions=1, l_prev=None, h_prev=None, s_prev=None, sse_prev=None):
+    """
+    PyTorch version of minimal-jerk prediction.
+    x, y: 1D tensors (timestamps, values)
+    Returns predictions (tensor) and optional params
+    """
+    delta_x = x[1] - x[0]
+    s, l, h, sse = fit_bell_analytic_h_torch(x, y)
+
+    next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions+1, device=x.device, dtype=x.dtype)
+    direct_predictions = h * canonical_bell_torch((next_xs - s)/l)
+
+    if l_prev is None:
+        return direct_predictions, s, l, h, sse
+
+    predictions_from_previous = h_prev * canonical_bell_torch((next_xs - s_prev)/l_prev)
+    confidence = 1 / sse
+    confidence_prev = 1 / sse_prev
+    alpha = confidence / (confidence + confidence_prev)
+    predictions = alpha * direct_predictions + (1-alpha) * predictions_from_previous
+    return predictions, s, l, h, sse
     
 
 
@@ -175,6 +256,7 @@ def f_wrapper(x_history):
             pred = predict_minimal_jerk(x=np.arange(history), y=ys)
             
             # pred is a tuple (predictions, s, l, h, sse), take the first element 
+            
             if isinstance(pred, tuple):
                 pred_value = pred[0]
             else:
@@ -184,5 +266,39 @@ def f_wrapper(x_history):
 
     # Unsqueeze last dim for KalmanNet
     x_next = x_next.unsqueeze(-1)  # [batch, m, 1]
+
+    return x_next
+
+def f_wrapper_torch(x_history: torch.Tensor, nbr_predictions=1):
+    """
+    KalmanNet dynamics wrapper using minimal-jerk prior (fully vectorized).
+    
+    Args:
+        x_history: [batch, m, history] tensor of past states
+        nbr_predictions: number of future steps to predict
+    
+    Returns:
+        x_next: [batch, m, nbr_predictions] tensor of predicted next states
+    """
+    batch_size, m, history = x_history.shape
+    device = x_history.device
+    dtype = x_history.dtype
+
+    # Prepare output tensor
+    x_next = torch.zeros(batch_size, m, nbr_predictions, device=device, dtype=dtype)
+
+    # Generate timestamps
+    x = torch.arange(history, device=device, dtype=dtype)
+
+    # Iterate only over axes (usually very small, like m=2), batch fully vectorized
+    for axis in range(m):
+        # y_history: [batch, history] for this axis
+        y_history = x_history[:, axis, :]
+
+        # Compute minimal-jerk parameters for each batch
+        for b in range(batch_size):
+            y = y_history[b]
+            pred, s, l, h, sse = predict_minimal_jerk_torch(x, y, nbr_predictions=nbr_predictions)
+            x_next[b, axis, :] = pred
 
     return x_next

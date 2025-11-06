@@ -102,6 +102,13 @@ else:
     cv_target = cv_target_long[:, :, :args.T]
     cv_input = cv_input_long[:, :, :args.T]
 
+train_input = train_input.to(device)
+train_target = train_target.to(device)
+cv_input = cv_input.to(device)
+cv_target = cv_target.to(device)
+train_init = train_init.to(device)
+test_input = test_input.to(device)
+test_target = test_target.to(device)
 
 history = 30
 
@@ -109,9 +116,6 @@ history = 30
 sys_model = SystemModel(f_wrapper, Q, h_identity, R, T=train_input.shape[2], T_test=test_input.shape[2], m=m, n=n, history=history)
 # Initial state mean and covariance
 sys_model.InitSequence(torch.zeros(m, 1), torch.eye(m))
-
-
-
 
 
 #####################
@@ -162,11 +166,6 @@ np.savez(filename,
          predicted_states=predicted_states,
          ground_truth=ground_truth,
          observations=observations)
-# if(chop):
-#     [MSE_cv_linear_epoch, MSE_cv_dB_epoch, MSE_train_linear_epoch, MSE_train_dB_epoch] = KNet_Pipeline.NNTrain(sys_model, cv_input, cv_target, train_input, train_target, path_results,randomInit=True,train_init=train_init)
-# else:
-#     [MSE_cv_linear_epoch, MSE_cv_dB_epoch, MSE_train_linear_epoch, MSE_train_dB_epoch] = KNet_Pipeline.NNTrain(sys_model, cv_input, cv_target, train_input, train_target, path_results)
-# ## Test Neural Network
-# [MSE_test_linear_arr, MSE_test_linear_avg, MSE_test_dB_avg,Knet_out,RunTime] = KNet_Pipeline.NNTest(sys_model, test_input, test_target, path_results)
+
 
 
