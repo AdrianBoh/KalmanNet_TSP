@@ -150,27 +150,109 @@ def fit_bell_analytic_h(x, y):
 
     return s_opt, l_opt, h_opt, sse, res
 
-def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, ridge=1e-12):
+def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, lr=0.01, n_iter=200, ridge=1e-12):
     """
-    Torch version of analytic bell fitting.
+    Torch version of analytic bell fitting with optimization for s and l.
     x: [T] tensor (timestamps)
     y: [T] tensor (values)
     Returns s, l, h, sse
     """
+    device = x.device
     x0, x9 = x.min(), x.max()
 
-    # initial guess
-    s = x0 + 0.25*(x9 - x0)
-    l = torch.clamp(x9 - s, min=0.5)
+    # Initialize s and l as trainable parameters
+    s = torch.tensor(x0 + 0.25*(x9 - x0), dtype=torch.float32, device=device, requires_grad=True)
+    l = torch.tensor(max(0.5, (x9 - s).item()), dtype=torch.float32, device=device, requires_grad=True)
 
-    # Compute phi
-    u = (x - s) / l
-    phi = canonical_bell_torch(u)
+    optimizer = torch.optim.LBFGS([s, l], lr=lr, max_iter=n_iter)
 
-    # h analytic
-    h = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
-    sse = torch.sum((y - h*phi)**2)
-    return s, l, h, sse
+    def closure():
+        optimizer.zero_grad()
+        # clamp l to avoid division by zero
+        l_clamped = torch.clamp(l, min=1e-6)
+        u = (x - s) / l_clamped
+        phi = canonical_bell_torch(u)
+        # compute analytic h
+        h = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
+        sse = torch.sum((y - h*phi)**2)
+        sse.backward()
+        return sse
+
+    optimizer.step(closure)
+
+    # final optimized s, l
+    with torch.no_grad():
+        l_final = torch.clamp(l, min=1e-6)
+        u = (x - s) / l_final
+        phi = canonical_bell_torch(u)
+        h_final = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
+        sse_final = torch.sum((y - h_final*phi)**2)
+
+    return s.detach(), l_final.detach(), h_final.detach(), sse_final.detach()
+
+def fit_bell_analytic_h_torch_batch(x: torch.Tensor, y: torch.Tensor, ridge=1e-12, lr=0.01, n_iter=200):
+    """
+    Batched version of fit_bell_analytic_h_torch with optimization of s and l.
+    
+    Args:
+        x: [batch, T] timestamps
+        y: [batch, T] values
+        ridge: small regularization for h computation
+        lr: learning rate for optimizer
+        n_iter: number of L-BFGS iterations
+    Returns:
+        s, l, h, sse: [batch] tensors
+    """
+    batch_size, T = x.shape
+    device = x.device
+    dtype = x.dtype
+
+    # Initial guess: s = x0 + 0.25*(x9-x0), l = max(0.5, x9-s)
+    x0 = x[:, 0]
+    x9 = x[:, -1]
+
+    s_list = []
+    l_list = []
+    h_list = []
+    sse_list = []
+
+    for b in range(batch_size):
+        s = torch.tensor(x0[b] + 0.25*(x9[b] - x0[b]), dtype=dtype, device=device, requires_grad=True)
+        l = torch.tensor(max(0.5, (x9[b] - s).item()), dtype=dtype, device=device, requires_grad=True)
+
+        optimizer = torch.optim.LBFGS([s, l], lr=lr, max_iter=n_iter)
+
+        def closure():
+            optimizer.zero_grad()
+            l_clamped = torch.clamp(l, min=1e-6)
+            u = (x[b] - s) / l_clamped
+            phi = canonical_bell_torch(u)
+            h = torch.sum(phi * y[b]) / (torch.sum(phi**2) + ridge)
+            sse = torch.sum((y[b] - h*phi)**2)
+            sse.backward()
+            return sse
+
+        optimizer.step(closure)
+
+        # store optimized results
+        with torch.no_grad():
+            l_final = torch.clamp(l, min=1e-6)
+            u = (x[b] - s) / l_final
+            phi = canonical_bell_torch(u)
+            h_final = torch.sum(phi * y[b]) / (torch.sum(phi**2) + ridge)
+            sse_final = torch.sum((y[b] - h_final*phi)**2)
+
+        s_list.append(s.detach())
+        l_list.append(l_final.detach())
+        h_list.append(h_final.detach())
+        sse_list.append(sse_final.detach())
+
+    s_batch = torch.stack(s_list)
+    l_batch = torch.stack(l_list)
+    h_batch = torch.stack(h_list)
+    sse_batch = torch.stack(sse_list)
+
+    return s_batch, l_batch, h_batch, sse_batch
 
 def predict_minimal_jerk(x, y, l_prev=None, h_prev=None, s_prev=None, sse_prev=None, nbr_predictions=1):
     """
@@ -203,18 +285,79 @@ def predict_minimal_jerk(x, y, l_prev=None, h_prev=None, s_prev=None, sse_prev=N
     predictions = alpha*direct_predictions + (1-alpha)*predictions_from_previous
     return predictions, s, l, h, sse
 
-def predict_minimal_jerk_torch(x: torch.Tensor, y: torch.Tensor, nbr_predictions=1):
+def predict_minimal_jerk_torch(x: torch.Tensor, y: torch.Tensor,
+                               l_prev=None, h_prev=None, s_prev=None, sse_prev=None,
+                               nbr_predictions=1):
     """
-    Torch version of minimal-jerk predictor for a single sequence.
-    x: [T]
-    y: [T]
-    Returns next predictions: [nbr_predictions]
+    Torch version of minimal-jerk predictor that mirrors original numpy version.
+    x: [T] timestamps
+    y: [T] values
+    Returns:
+        predictions: [nbr_predictions]
+        s, l, h, sse
     """
     delta_x = x[1] - x[0]
+    s, l, h, sse = fit_bell_analytic_h_torch(x, y)  # returns torch scalars
+
+    next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions+1, device=x.device, dtype=x.dtype)
+    direct_predictions = h * canonical_bell_torch((next_xs - s) / l)
+
+    if l_prev is None or h_prev is None or s_prev is None or sse_prev is None:
+        return direct_predictions, s, l, h, sse
+
+    predictions_from_previous = h_prev * canonical_bell_torch((next_xs - s_prev) / l_prev)
+    confidence = 1 / sse
+    confidence_prev = 1 / sse_prev
+    alpha = confidence / (confidence + confidence_prev)
+    predictions = alpha * direct_predictions + (1 - alpha) * predictions_from_previous
+
+    return predictions, s, l, h, sse
+
+
+def predict_minimal_jerk_torch_batch(x: torch.Tensor, y: torch.Tensor,
+                               l_prev=None, h_prev=None, s_prev=None, sse_prev=None,
+                               nbr_predictions=1):
+    """
+    Torch version of minimal-jerk predictor for a single sequence.
+    Replicates the original numpy version with optional blending of previous prediction.
+
+    Args:
+        x: [T] timestamps
+        y: [T] values
+        l_prev, h_prev, s_prev, sse_prev: previous bell parameters
+        nbr_predictions: number of steps to predict
+
+    Returns:
+        predictions: [nbr_predictions]
+        s, l, h, sse
+    """
+    delta_x = x[1] - x[0]
+    
+    # Fit current bell parameters
     s, l, h, sse = fit_bell_analytic_h_torch(x, y)
-    next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions+1, device=x.device)
-    predictions = h * canonical_bell_torch((next_xs - s) / l)
-    return predictions
+
+    # Compute next timestamps
+    next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions + 1, device=x.device, dtype=x.dtype)
+
+    # Direct prediction using current bell
+    direct_predictions = h * canonical_bell_torch((next_xs - s) / l)
+
+    # If no previous bell, just return direct prediction
+    if l_prev is None or h_prev is None or s_prev is None or sse_prev is None:
+        return direct_predictions, s, l, h, sse
+
+    # Prediction from previous bell
+    prev_predictions = h_prev * canonical_bell_torch((next_xs - s_prev) / l_prev)
+
+    # Compute blending factor based on confidence
+    confidence = 1.0 / sse
+    confidence_prev = 1.0 / sse_prev
+    alpha = confidence / (confidence + confidence_prev)
+
+    # Blend predictions
+    predictions = alpha * direct_predictions + (1 - alpha) * prev_predictions
+
+    return predictions, s, l, h, sse 
     
 
 
@@ -254,23 +397,128 @@ def f_wrapper(x_history):
 
     return x_next
 
-def f_wrapper_torch(x_history: torch.Tensor, nbr_predictions=1) -> torch.Tensor:
+def f_wrapper_torch(x_history: torch.Tensor,
+                    l_prev=None, h_prev=None, s_prev=None, sse_prev=None,
+                    nbr_predictions=1) -> torch.Tensor:
     """
     Vectorized KalmanNet wrapper using minimal-jerk prior (torch version).
-    x_history: [batch, m, T]
-    Returns: [batch, m, nbr_predictions]
+
+    Args:
+        x_history: [batch, m, T] past states
+        l_prev, h_prev, s_prev, sse_prev: optional previous bell parameters for blending
+        nbr_predictions: number of steps to predict
+
+    Returns:
+        x_next: [batch, m, nbr_predictions] predicted next states
     """
     batch_size, m, T = x_history.shape
     device = x_history.device
-    x_next = torch.zeros(batch_size, m, nbr_predictions, device=device)
+    dtype = x_history.dtype
 
-    # loop over state dimensions, but keep batch vectorized
-    for axis in range(m):
-        ys = x_history[:, axis, :]  # [batch, T]
-        xs = torch.arange(T, device=device).expand(batch_size, T)  # [batch, T]
+    # Output tensor
+    x_next = torch.zeros(batch_size, m, nbr_predictions, device=device, dtype=dtype)
 
-        # fit bell and predict for each batch element
-        for b in range(batch_size):
-            x_next[b, axis, :] = predict_minimal_jerk_torch(xs[b], ys[b], nbr_predictions=nbr_predictions)
+    # Time indices
+    xs = torch.arange(T, device=device, dtype=dtype).expand(batch_size, T)  # [batch, T]
+    delta_x = xs[0, 1] - xs[0, 0]  # assume uniform
+
+    # Flatten batch and axes for vectorized computation
+    ys_flat = x_history.reshape(batch_size * m, T)
+    xs_flat = xs.repeat(m, 1)  # shape [m*batch, T], matches ys_flat
+
+    # Prepare previous parameters if given
+    if l_prev is not None:
+        l_prev_flat = l_prev.reshape(batch_size * m)
+        h_prev_flat = h_prev.reshape(batch_size * m)
+        s_prev_flat = s_prev.reshape(batch_size * m)
+        sse_prev_flat = sse_prev.reshape(batch_size * m)
+    else:
+        l_prev_flat = h_prev_flat = s_prev_flat = sse_prev_flat = None
+
+    # Predict each sequence
+    preds = []
+    s_all, l_all, h_all, sse_all = [], [], [], []
+    for i in range(batch_size * m):
+        pred, s, l, h, sse = predict_minimal_jerk_torch(
+            xs_flat[i],
+            ys_flat[i],
+            l_prev=l_prev_flat[i] if l_prev_flat is not None else None,
+            h_prev=h_prev_flat[i] if h_prev_flat is not None else None,
+            s_prev=s_prev_flat[i] if s_prev_flat is not None else None,
+            sse_prev=sse_prev_flat[i] if sse_prev_flat is not None else None,
+            nbr_predictions=nbr_predictions
+        )
+        preds.append(pred)
+        s_all.append(s)
+        l_all.append(l)
+        h_all.append(h)
+        sse_all.append(sse)
+
+    # Stack and reshape back to [batch, m, nbr_predictions]
+    x_next = torch.stack(preds, dim=0).reshape(batch_size, m, nbr_predictions)
+    s_all = torch.stack(s_all).reshape(batch_size, m)
+    l_all = torch.stack(l_all).reshape(batch_size, m)
+    h_all = torch.stack(h_all).reshape(batch_size, m)
+    sse_all = torch.stack(sse_all).reshape(batch_size, m)
+
+    return x_next, s_all, l_all, h_all, sse_all
+
+def f_wrapper_torch_full(x_history: torch.Tensor,
+                          l_prev=None, h_prev=None, s_prev=None, sse_prev=None,
+                          nbr_predictions=1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fully vectorized minimal-jerk KalmanNet wrapper (torch version).
+
+    Args:
+        x_history: [batch, m, T] past states
+        l_prev, h_prev, s_prev, sse_prev: optional previous bell parameters for blending
+        nbr_predictions: number of steps to predict
+
+    Returns:
+        x_next: [batch, m, nbr_predictions]
+        s_all, l_all, h_all, sse_all: parameters of the bells for each batch/m
+    """
+    batch_size, m, T = x_history.shape
+    device = x_history.device
+    dtype = x_history.dtype
+
+    # Flatten batch and state for vectorized computation
+    ys_flat = x_history.reshape(batch_size * m, T)
+    xs_flat = torch.arange(T, device=device, dtype=dtype).expand(batch_size * m, T)
+
+    # Fit bell for all sequences
+    s_all, l_all, h_all, sse_all = fit_bell_analytic_h_torch_batch(xs_flat.detach(), ys_flat.detach())
+
+    # Prepare previous parameters if given
+    if l_prev is not None:
+        l_prev_flat = l_prev.reshape(-1)
+        h_prev_flat = h_prev.reshape(-1)
+        s_prev_flat = s_prev.reshape(-1)
+        sse_prev_flat = sse_prev.reshape(-1)
+        use_prev = True
+    else:
+        use_prev = False
+
+    # Compute next time indices
+    delta_x = xs_flat[:, 1] - xs_flat[:, 0]  # shape [batch*m]
+    next_xs = xs_flat[:, -1].unsqueeze(1) + delta_x.unsqueeze(1) * torch.arange(1, nbr_predictions+1, device=device, dtype=dtype).unsqueeze(0)  # [batch*m, nbr_predictions]
+
+    # Compute minimal-jerk bell
+    u = (next_xs - s_all.unsqueeze(1)) / l_all.unsqueeze(1)  # [batch*m, nbr_predictions]
+    direct_preds = h_all.unsqueeze(1) * canonical_bell_torch(u)
+
+    if use_prev:
+        u_prev = (next_xs - s_prev_flat.unsqueeze(1)) / l_prev_flat.unsqueeze(1)
+        prev_preds = h_prev_flat.unsqueeze(1) * canonical_bell_torch(u_prev)
+        confidence = 1 / sse_all.unsqueeze(1)
+        confidence_prev = 1 / sse_prev_flat.unsqueeze(1)
+        alpha = confidence / (confidence + confidence_prev)
+        x_next_flat = alpha * direct_preds + (1 - alpha) * prev_preds
+    else:
+        x_next_flat = direct_preds
+
+    # Reshape back to [batch, m, nbr_predictions]
+    x_next = x_next_flat.reshape(batch_size, m, nbr_predictions)
+
 
     return x_next
