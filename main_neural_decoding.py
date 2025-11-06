@@ -37,7 +37,7 @@ args.N_T = 200
 args.T = 100
 args.T_test = 100
 ### training parameters
-args.use_cuda = False # use GPU or not
+args.use_cuda = True # use GPU or not
 args.n_steps = 20 #2000
 args.n_batch = 30
 args.lr = 1e-3
@@ -113,7 +113,7 @@ test_target = test_target.to(device)
 history = 30
 
 
-sys_model = SystemModel(f_wrapper, Q, h_identity, R, T=train_input.shape[2], T_test=test_input.shape[2], m=m, n=n, history=history)
+sys_model = SystemModel(f_wrapper_torch, Q, h_identity, R, T=train_input.shape[2], T_test=test_input.shape[2], m=m, n=n, history=history)
 # Initial state mean and covariance
 sys_model.InitSequence(torch.zeros(m, 1), torch.eye(m))
 

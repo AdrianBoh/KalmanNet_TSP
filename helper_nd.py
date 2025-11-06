@@ -65,7 +65,11 @@ def canonical_bell(u):
     out[mask] = 30*uu**2 - 60*uu**3 + 30*uu**4
     return out
 
-def canonical_bell_torch(u):
+def canonical_bell_torch(u: torch.Tensor) -> torch.Tensor:
+    """
+    Canonical minimal-jerk bell curve in [0,1], torch version.
+    u: tensor of any shape
+    """
     out = torch.zeros_like(u)
     mask = (u >= 0) & (u <= 1)
     uu = u[mask]
@@ -146,37 +150,27 @@ def fit_bell_analytic_h(x, y):
 
     return s_opt, l_opt, h_opt, sse, res
 
-def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, n_iter=100):
+def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, ridge=1e-12):
     """
-    PyTorch version of fit_bell_analytic_h.
-    x, y: 1D tensors
-    Returns s_opt, l_opt, h_opt, sse
+    Torch version of analytic bell fitting.
+    x: [T] tensor (timestamps)
+    y: [T] tensor (values)
+    Returns s, l, h, sse
     """
-    device = x.device
     x0, x9 = x.min(), x.max()
 
-    # Initial guess
-    s = torch.tensor(x0 + 0.25*(x9 - x0), dtype=torch.float32, device=device, requires_grad=True)
-    l = torch.tensor(max(0.5, (x9 - s).item()), dtype=torch.float32, device=device, requires_grad=True)
+    # initial guess
+    s = x0 + 0.25*(x9 - x0)
+    l = torch.clamp(x9 - s, min=0.5)
 
-    optimizer = torch.optim.LBFGS([s, l], max_iter=n_iter, line_search_fn='strong_wolfe')
+    # Compute phi
+    u = (x - s) / l
+    phi = canonical_bell_torch(u)
 
-    def closure():
-        optimizer.zero_grad()
-        loss = reduced_cost_torch(torch.stack([s, l]), x, y)
-        loss.backward()
-        return loss
-
-    optimizer.step(closure)
-
-    with torch.no_grad():
-        s_opt, l_opt = s.item(), l.item()
-        u = (x - s_opt)/l_opt
-        phi = canonical_bell_torch(u)
-        h_opt = torch.sum(phi * y) / torch.sum(phi**2)
-        sse = torch.sum((y - h_opt*phi)**2).item()
-
-    return s_opt, l_opt, h_opt.item(), sse
+    # h analytic
+    h = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
+    sse = torch.sum((y - h*phi)**2)
+    return s, l, h, sse
 
 def predict_minimal_jerk(x, y, l_prev=None, h_prev=None, s_prev=None, sse_prev=None, nbr_predictions=1):
     """
@@ -209,27 +203,18 @@ def predict_minimal_jerk(x, y, l_prev=None, h_prev=None, s_prev=None, sse_prev=N
     predictions = alpha*direct_predictions + (1-alpha)*predictions_from_previous
     return predictions, s, l, h, sse
 
-def predict_minimal_jerk_torch(x: torch.Tensor, y: torch.Tensor, nbr_predictions=1, l_prev=None, h_prev=None, s_prev=None, sse_prev=None):
+def predict_minimal_jerk_torch(x: torch.Tensor, y: torch.Tensor, nbr_predictions=1):
     """
-    PyTorch version of minimal-jerk prediction.
-    x, y: 1D tensors (timestamps, values)
-    Returns predictions (tensor) and optional params
+    Torch version of minimal-jerk predictor for a single sequence.
+    x: [T]
+    y: [T]
+    Returns next predictions: [nbr_predictions]
     """
     delta_x = x[1] - x[0]
     s, l, h, sse = fit_bell_analytic_h_torch(x, y)
-
-    next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions+1, device=x.device, dtype=x.dtype)
-    direct_predictions = h * canonical_bell_torch((next_xs - s)/l)
-
-    if l_prev is None:
-        return direct_predictions, s, l, h, sse
-
-    predictions_from_previous = h_prev * canonical_bell_torch((next_xs - s_prev)/l_prev)
-    confidence = 1 / sse
-    confidence_prev = 1 / sse_prev
-    alpha = confidence / (confidence + confidence_prev)
-    predictions = alpha * direct_predictions + (1-alpha) * predictions_from_previous
-    return predictions, s, l, h, sse
+    next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions+1, device=x.device)
+    predictions = h * canonical_bell_torch((next_xs - s) / l)
+    return predictions
     
 
 
@@ -269,36 +254,23 @@ def f_wrapper(x_history):
 
     return x_next
 
-def f_wrapper_torch(x_history: torch.Tensor, nbr_predictions=1):
+def f_wrapper_torch(x_history: torch.Tensor, nbr_predictions=1) -> torch.Tensor:
     """
-    KalmanNet dynamics wrapper using minimal-jerk prior (fully vectorized).
-    
-    Args:
-        x_history: [batch, m, history] tensor of past states
-        nbr_predictions: number of future steps to predict
-    
-    Returns:
-        x_next: [batch, m, nbr_predictions] tensor of predicted next states
+    Vectorized KalmanNet wrapper using minimal-jerk prior (torch version).
+    x_history: [batch, m, T]
+    Returns: [batch, m, nbr_predictions]
     """
-    batch_size, m, history = x_history.shape
+    batch_size, m, T = x_history.shape
     device = x_history.device
-    dtype = x_history.dtype
+    x_next = torch.zeros(batch_size, m, nbr_predictions, device=device)
 
-    # Prepare output tensor
-    x_next = torch.zeros(batch_size, m, nbr_predictions, device=device, dtype=dtype)
-
-    # Generate timestamps
-    x = torch.arange(history, device=device, dtype=dtype)
-
-    # Iterate only over axes (usually very small, like m=2), batch fully vectorized
+    # loop over state dimensions, but keep batch vectorized
     for axis in range(m):
-        # y_history: [batch, history] for this axis
-        y_history = x_history[:, axis, :]
+        ys = x_history[:, axis, :]  # [batch, T]
+        xs = torch.arange(T, device=device).expand(batch_size, T)  # [batch, T]
 
-        # Compute minimal-jerk parameters for each batch
+        # fit bell and predict for each batch element
         for b in range(batch_size):
-            y = y_history[b]
-            pred, s, l, h, sse = predict_minimal_jerk_torch(x, y, nbr_predictions=nbr_predictions)
-            x_next[b, axis, :] = pred
+            x_next[b, axis, :] = predict_minimal_jerk_torch(xs[b], ys[b], nbr_predictions=nbr_predictions)
 
     return x_next
