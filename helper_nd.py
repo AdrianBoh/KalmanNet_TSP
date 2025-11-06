@@ -124,8 +124,8 @@ def fit_bell_analytic_h(x, y):
     x0, x9 = x.min(), x.max()
 
     # Initial guess
-    s0 = x0 + 0.25*(x9 - x0)
-    l0 = max(0.5, x9 - s0)
+    s0 = x0 
+    l0 = x9 - s0
     init = np.array([s0, l0])
 
     # Bounds: s in [0,x0], l>0
@@ -138,8 +138,11 @@ def fit_bell_analytic_h(x, y):
     #lin_con = LinearConstraint(A, -np.inf*np.ones_like(b), b)
 
     # Optimize s and l
+    # res = minimize(reduced_cost, init, args=(x, y),
+    #                method='L-BFGS-B', bounds=bounds)
+    
     res = minimize(reduced_cost, init, args=(x, y),
-                   method='L-BFGS-B', bounds=bounds)
+               method='Powell', bounds=bounds, options={'maxiter': 50, 'xtol': 1e-4})
 
     s_opt, l_opt = res.x
     u = (x - s_opt)/l_opt
@@ -153,26 +156,37 @@ def fit_bell_analytic_h(x, y):
 def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, lr=0.01, n_iter=200, ridge=1e-12):
     """
     Torch version of analytic bell fitting with optimization for s and l.
-    x: [T] tensor (timestamps)
-    y: [T] tensor (values)
-    Returns s, l, h, sse
+    l is constrained to [0.1*window, 20*window]
+    
+    Args:
+        x: [T] timestamps
+        y: [T] values
+        lr: learning rate for optimizer
+        n_iter: max iterations for L-BFGS
+        ridge: small regularization for analytic h
+    Returns:
+        s, l, h, sse
     """
     device = x.device
-    x0, x9 = x.min(), x.max()
-
+    window_len = (x.max() - x.min()).item()
+    
     # Initialize s and l as trainable parameters
-    s = torch.tensor(x0 + 0.25*(x9 - x0), dtype=torch.float32, device=device, requires_grad=True)
-    l = torch.tensor(max(0.5, (x9 - s).item()), dtype=torch.float32, device=device, requires_grad=True)
+    s = torch.tensor(x[0] + 0.25*window_len, dtype=torch.float32, device=device, requires_grad=True)
+    l = torch.tensor(max(0.5, 0.25*window_len), dtype=torch.float32, device=device, requires_grad=True)
+
+    print("initialized parameters")
 
     optimizer = torch.optim.LBFGS([s, l], lr=lr, max_iter=n_iter)
 
+    min_l = 0.1 * window_len
+    max_l = 20.0 * window_len
+
     def closure():
         optimizer.zero_grad()
-        # clamp l to avoid division by zero
-        l_clamped = torch.clamp(l, min=1e-6)
+        # clamp l to avoid divide-by-zero and enforce limits
+        l_clamped = torch.clamp(l, min=min_l, max=max_l)
         u = (x - s) / l_clamped
         phi = canonical_bell_torch(u)
-        # compute analytic h
         h = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
         sse = torch.sum((y - h*phi)**2)
         sse.backward()
@@ -182,7 +196,7 @@ def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, lr=0.01, n_iter=
 
     # final optimized s, l
     with torch.no_grad():
-        l_final = torch.clamp(l, min=1e-6)
+        l_final = torch.clamp(l, min=min_l, max=max_l)
         u = (x - s) / l_final
         phi = canonical_bell_torch(u)
         h_final = torch.sum(phi * y) / (torch.sum(phi**2) + ridge)
@@ -190,58 +204,72 @@ def fit_bell_analytic_h_torch(x: torch.Tensor, y: torch.Tensor, lr=0.01, n_iter=
 
     return s.detach(), l_final.detach(), h_final.detach(), sse_final.detach()
 
-def fit_bell_analytic_h_torch_batch(x: torch.Tensor, y: torch.Tensor, ridge=1e-12, lr=0.01, n_iter=200):
+def fit_bell_analytic_h_torch_batch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    ridge: float = 1e-12,
+    lr: float = 0.05,
+    n_iter: int = 100,
+    min_l_factor: float = 0.1,
+    max_l_factor: float = 20.0
+):
     """
-    Batched version of fit_bell_analytic_h_torch with optimization of s and l.
+    Fully batched torch version of analytic bell fitting with optimization for s and l.
     
     Args:
         x: [batch, T] timestamps
         y: [batch, T] values
         ridge: small regularization for h computation
         lr: learning rate for optimizer
-        n_iter: number of L-BFGS iterations
+        n_iter: number of gradient descent iterations
+        min_l_factor: minimum allowed l relative to window size
+        max_l_factor: maximum allowed l relative to window size
+    
     Returns:
-        s, l, h, sse: [batch] tensors
+        s: [batch] optimal shifts
+        l: [batch] optimal lengths
+        h: [batch] optimal amplitudes
+        sse: [batch] sum of squared errors
     """
     batch_size, T = x.shape
     device = x.device
     dtype = x.dtype
 
-    # Initial guess: s = x0 + 0.25*(x9-x0), l = max(0.5, x9-s)
     x0 = x[:, 0]
-    x9 = x[:, -1]
+    xT = x[:, -1]
+    window = xT - x0
 
-    s_list = []
-    l_list = []
-    h_list = []
-    sse_list = []
+    # Initial guesses
+    initial_s = x0 + 0.25 * window
+    initial_l = torch.clamp(window, min=0.5)
+
+    min_l = min_l_factor * window   # window is [batch_size]
+    max_l = max_l_factor * window
+    
+    s_list, l_list, h_list, sse_list = [], [], [], []
 
     for b in range(batch_size):
-        s = torch.tensor(x0[b] + 0.25*(x9[b] - x0[b]), dtype=dtype, device=device, requires_grad=True)
-        l = torch.tensor(max(0.5, (x9[b] - s).item()), dtype=dtype, device=device, requires_grad=True)
-
-        optimizer = torch.optim.LBFGS([s, l], lr=lr, max_iter=n_iter)
-
-        def closure():
-            optimizer.zero_grad()
-            l_clamped = torch.clamp(l, min=1e-6)
-            u = (x[b] - s) / l_clamped
-            phi = canonical_bell_torch(u)
-            h = torch.sum(phi * y[b]) / (torch.sum(phi**2) + ridge)
-            sse = torch.sum((y[b] - h*phi)**2)
-            sse.backward()
-            return sse
-
-        optimizer.step(closure)
-
-        # store optimized results
+        s = initial_s[b].clone().detach().requires_grad_(True)
+        l = initial_l[b].clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([s, l], lr=lr)
+        
         with torch.no_grad():
-            l_final = torch.clamp(l, min=1e-6)
+            for _ in range(n_iter):
+                optimizer.zero_grad()
+                l_clamped = torch.clamp(l, min=min_l[b], max=max_l[b])
+                u = (x[b] - s) / l_clamped
+                phi = canonical_bell_torch(u)
+                h = torch.sum(phi * y[b]) / (torch.sum(phi**2) + ridge)
+                sse = torch.sum((y[b] - h*phi)**2)
+                optimizer.step()
+        
+        with torch.no_grad():
+            l_final = torch.clamp(l, min=min_l[b], max=max_l[b])
             u = (x[b] - s) / l_final
             phi = canonical_bell_torch(u)
             h_final = torch.sum(phi * y[b]) / (torch.sum(phi**2) + ridge)
             sse_final = torch.sum((y[b] - h_final*phi)**2)
-
+        
         s_list.append(s.detach())
         l_list.append(l_final.detach())
         h_list.append(h_final.detach())
@@ -334,7 +362,7 @@ def predict_minimal_jerk_torch_batch(x: torch.Tensor, y: torch.Tensor,
     delta_x = x[1] - x[0]
     
     # Fit current bell parameters
-    s, l, h, sse = fit_bell_analytic_h_torch(x, y)
+    s, l, h, sse = fit_bell_analytic_h_torch_batch(x, y)
 
     # Compute next timestamps
     next_xs = x[-1] + delta_x * torch.arange(1, nbr_predictions + 1, device=x.device, dtype=x.dtype)
@@ -375,6 +403,8 @@ def f_wrapper(x_history):
     batch_size, m, history = x_history.shape
     device = x_history.device
     x_next = torch.zeros(batch_size, m, device=device)
+
+    print("wrapper called")
 
     for b in range(batch_size):
         for axis in range(m):
@@ -486,8 +516,12 @@ def f_wrapper_torch_full(x_history: torch.Tensor,
     ys_flat = x_history.reshape(batch_size * m, T)
     xs_flat = torch.arange(T, device=device, dtype=dtype).expand(batch_size * m, T)
 
+    print("about to fit bell")
+
     # Fit bell for all sequences
     s_all, l_all, h_all, sse_all = fit_bell_analytic_h_torch_batch(xs_flat.detach(), ys_flat.detach())
+
+    print(s_all.shape)
 
     # Prepare previous parameters if given
     if l_prev is not None:
